@@ -1,1 +1,7 @@
 .venv
+.idea
+__pycache__
+*.csv
+/data_generation
+*.json
+*.ckpt
