@@ -1,9 +1,8 @@
-"""Utility helpers for dataset selection and baseline evaluation."""
+"""Utility helpers for benchmark generation and evaluation."""
 
 from __future__ import annotations
 
 import gc
-import hashlib
 import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -11,82 +10,12 @@ from typing import TYPE_CHECKING, Protocol
 import pandas as pd
 
 if TYPE_CHECKING:
+    import torch
     from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 
-DEFAULT_TEST_FRACTION = 0.10
 DEFAULT_LABEL_COLUMN = "is_sarcastic"
-
-
-def _normalise_value(value: object) -> str:
-    if pd.isna(value):
-        return "<NA>"
-    return str(value)
-
-
-def _stable_row_hash(row: pd.Series, columns: list[str]) -> str:
-    signature = "||".join(
-        f"{column}={_normalise_value(row[column])}"
-        for column in columns
-    )
-    return hashlib.sha256(signature.encode("utf-8")).hexdigest()
-
-
-def get_test_set(
-    dataset: pd.DataFrame,
-    test_fraction: float = DEFAULT_TEST_FRACTION,
-    label_column: str = DEFAULT_LABEL_COLUMN,
-) -> pd.DataFrame:
-    """Return a deterministic, balanced test set from a sarcasm dataset.
-
-    The returned split is approximately ``test_fraction`` of the full dataset and
-    always contains the same number of label ``0`` and label ``1`` examples. If
-    the requested test size is odd, the function rounds down to the nearest even
-    number so the split can remain perfectly balanced.
-    """
-
-    if dataset.empty:
-        raise ValueError("`dataset` must contain at least one row.")
-    if not 0 < test_fraction <= 1:
-        raise ValueError("`test_fraction` must be in the interval (0, 1].")
-    if label_column not in dataset.columns:
-        raise ValueError(f"Missing required label column: {label_column!r}")
-
-    target_size = math.floor(len(dataset) * test_fraction)
-    if target_size < 2:
-        raise ValueError("The requested test split is too small to balance across two classes.")
-    if target_size % 2 == 1:
-        target_size -= 1
-
-    per_class_size = target_size // 2
-    label_counts = dataset[label_column].value_counts()
-    for label in (0, 1):
-        if int(label_counts.get(label, 0)) < per_class_size:
-            raise ValueError(
-                f"Not enough samples for label {label}: "
-                f"required {per_class_size}, found {int(label_counts.get(label, 0))}."
-            )
-
-    hash_columns = sorted(dataset.columns.tolist())
-    ranked_df = dataset.copy()
-    ranked_df["_deterministic_hash"] = ranked_df.apply(
-        lambda row: _stable_row_hash(row, hash_columns),
-        axis=1,
-    )
-
-    selected_parts = []
-    for label in (0, 1):
-        label_df = ranked_df.loc[ranked_df[label_column] == label]
-        label_df = label_df.sort_values("_deterministic_hash", kind="mergesort")
-        selected_parts.append(label_df.head(per_class_size))
-
-    test_df = pd.concat(selected_parts, ignore_index=True)
-    test_df = test_df.sort_values(
-        [label_column, "_deterministic_hash"],
-        kind="mergesort",
-    )
-    test_df = test_df.drop(columns="_deterministic_hash").reset_index(drop=True)
-    return test_df
+DEFAULT_HEADLINE_COLUMN = "headline"
 
 
 def get_source_style(label: int) -> str:
@@ -97,48 +26,106 @@ def get_target_style(label: int) -> str:
     return "non-sarcastic" if int(label) == 1 else "sarcastic"
 
 
+def get_target_publication(label: int) -> str:
+    return "HuffPost" if int(label) == 1 else "The Onion"
+
+
 def build_prompt(headline: str, label: int) -> str:
-    source_style = get_source_style(label)
-    target_style = get_target_style(label)
+    """Build a rewrite prompt that strongly steers toward the target style."""
+    headline = str(headline).strip()
+    if int(label) == 1:
+        return (
+            "Rewrite the following headline as a straightforward HuffPost-style "
+            "non-sarcastic headline. Preserve the same core meaning, entities, "
+            "and event details. Output only the rewritten headline.\n"
+            f"Original headline: {headline}\n"
+            "Rewritten headline:"
+        )
+
     return (
-        f"Rewrite the following news headline so that it becomes {target_style} "
-        f"while preserving the original meaning.\n"
-        f"Original style: {source_style}\n"
-        f"Headline: {headline}\n"
-        f"Rewritten headline:"
+        "Rewrite the following headline as an Onion-style sarcastic headline. "
+        "Preserve the same core meaning, entities, and event details. Output "
+        "only the rewritten headline.\n"
+        f"Original headline: {headline}\n"
+        "Rewritten headline:"
     )
 
 
 def clean_generation(text: str) -> str:
+    """Normalize generated text into a single clean headline string."""
     cleaned = " ".join(str(text).strip().split())
-    for prefix in ["rewritten headline:", "headline:"]:
-        if cleaned.lower().startswith(prefix):
+    lowered = cleaned.lower()
+    for prefix in (
+        "rewritten headline:",
+        "headline:",
+        "output:",
+        "answer:",
+    ):
+        if lowered.startswith(prefix):
             cleaned = cleaned[len(prefix) :].strip()
+            lowered = cleaned.lower()
     return cleaned
 
 
 def load_dataset(
     dataset_path: Path,
-    test_fraction: float = DEFAULT_TEST_FRACTION,
+    label_column: str = DEFAULT_LABEL_COLUMN,
+    headline_column: str = DEFAULT_HEADLINE_COLUMN,
 ) -> pd.DataFrame:
-    df = pd.read_json(dataset_path, lines=True)
-    df = get_test_set(df, test_fraction=test_fraction)
-    df = df[["headline", "is_sarcastic"]].copy()
-    df["source_style"] = df["is_sarcastic"].map(get_source_style)
-    df["target_style"] = df["is_sarcastic"].map(get_target_style)
-    df["prompt"] = df.apply(lambda row: build_prompt(row["headline"], row["is_sarcastic"]), axis=1)
-    return df
+    """Load an uploaded benchmark dataset and build prompts from its headlines."""
+    try:
+        df = pd.read_json(dataset_path, lines=True)
+    except ValueError:
+        df = pd.read_json(dataset_path)
+
+    required_columns = {headline_column, label_column}
+    missing_columns = required_columns.difference(df.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {sorted(missing_columns)}")
+
+    df = df[[headline_column, label_column]].copy()
+    df[headline_column] = df[headline_column].astype(str).str.strip()
+    df = df[df[headline_column] != ""].copy()
+    df[label_column] = df[label_column].astype(int)
+
+    invalid_labels = set(df[label_column].unique()) - {0, 1}
+    if invalid_labels:
+        raise ValueError(
+            f"{label_column!r} must contain only 0/1 values. Found: {sorted(invalid_labels)}"
+        )
+
+    df["source_style"] = df[label_column].map(get_source_style)
+    df["target_style"] = df[label_column].map(get_target_style)
+    df["target_publication"] = df[label_column].map(get_target_publication)
+    df["prompt"] = df.apply(
+        lambda row: build_prompt(row[headline_column], row[label_column]),
+        axis=1,
+    )
+    return df.reset_index(drop=True)
 
 
 def load_generation_model(
     model_name: str,
+    architecture: str,
     device: str,
     use_fp16_on_gpu: bool = True,
 ) -> tuple["PreTrainedTokenizerBase", "PreTrainedModel"]:
+    """Load either a seq2seq or decoder-only generation model."""
     import torch
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoModelForSeq2SeqLM,
+        AutoTokenizer,
+    )
+
+    if architecture not in {"seq2seq", "causal"}:
+        raise ValueError(
+            f"Unsupported architecture {architecture!r}. Use 'seq2seq' or 'causal'."
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if architecture == "causal":
+        tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -146,10 +133,30 @@ def load_generation_model(
     if device == "cuda" and use_fp16_on_gpu:
         model_kwargs["torch_dtype"] = torch.float16
 
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name, **model_kwargs)
+    model_cls = AutoModelForSeq2SeqLM if architecture == "seq2seq" else AutoModelForCausalLM
+    model = model_cls.from_pretrained(model_name, **model_kwargs)
+    if tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+        if getattr(model.generation_config, "pad_token_id", None) is None:
+            model.generation_config.pad_token_id = tokenizer.pad_token_id
+
     model.to(device)
     model.eval()
     return tokenizer, model
+
+
+def _decode_causal_outputs(
+    generated_ids: "torch.Tensor",
+    input_length: int,
+    tokenizer: "PreTrainedTokenizerBase",
+) -> list[str]:
+    decoded: list[str] = []
+
+    generated_ids = generated_ids.detach().cpu()
+    for sequence_ids in generated_ids:
+        continuation_ids = sequence_ids[input_length:]
+        decoded.append(tokenizer.decode(continuation_ids, skip_special_tokens=True))
+    return decoded
 
 
 def generate_rewrites(
@@ -157,6 +164,7 @@ def generate_rewrites(
     tokenizer: "PreTrainedTokenizerBase",
     model: "PreTrainedModel",
     device: str,
+    architecture: str,
     batch_size: int,
     max_source_length: int,
     generation_kwargs: dict,
@@ -184,7 +192,16 @@ def generate_rewrites(
                 pad_token_id=tokenizer.pad_token_id,
                 **generation_kwargs,
             )
-            decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+
+            if architecture == "causal":
+                decoded = _decode_causal_outputs(
+                    generated_ids=generated_ids,
+                    input_length=encoded["input_ids"].shape[1],
+                    tokenizer=tokenizer,
+                )
+            else:
+                decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+
             outputs.extend(clean_generation(text) for text in decoded)
 
     return outputs
@@ -194,6 +211,7 @@ class ModelSpecLike(Protocol):
     key: str
     label: str
     hf_name: str
+    architecture: str
 
 
 def run_generation_for_model(
@@ -218,6 +236,7 @@ def run_generation_for_model(
 
     tokenizer, model = load_generation_model(
         model_name=model_spec.hf_name,
+        architecture=model_spec.architecture,
         device=device,
         use_fp16_on_gpu=use_fp16_on_gpu,
     )
@@ -228,6 +247,7 @@ def run_generation_for_model(
             tokenizer=tokenizer,
             model=model,
             device=device,
+            architecture=model_spec.architecture,
             batch_size=batch_size,
             max_source_length=max_source_length,
             generation_kwargs=generation_kwargs,
@@ -243,10 +263,13 @@ def run_generation_for_model(
         if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    results_df = dataset_df[["headline", "is_sarcastic", "source_style", "target_style"]].copy()
+    results_df = dataset_df[
+        ["headline", "is_sarcastic", "source_style", "target_style", "target_publication"]
+    ].copy()
     results_df["model_key"] = model_spec.key
     results_df["model_label"] = model_spec.label
     results_df["model_name"] = model_spec.hf_name
+    results_df["model_architecture"] = model_spec.architecture
     results_df["generated_headline"] = pd.Series(generated_headlines, dtype="string")
     results_df["generated_headline"] = results_df["generated_headline"].fillna("").astype(str)
     results_df.to_csv(generation_path, index=False)
@@ -261,8 +284,8 @@ def evaluate_generations(
     perplexity_batch_size: int,
     force_rescore: bool = False,
 ) -> pd.DataFrame:
-    from text_perplexity import batch_perplexity
-    from text_similarity import batch_cosine_similarity
+    from evaluation.text_perplexity import batch_perplexity
+    from evaluation.text_similarity import batch_cosine_similarity
 
     model_key = generated_df["model_key"].iloc[0]
     metrics_path = output_dir / f"{run_name}_{model_key}_metrics.csv"
@@ -306,7 +329,10 @@ def evaluate_generations(
 
 def summarise_results(results_df: pd.DataFrame) -> pd.DataFrame:
     summary_df = (
-        results_df.groupby(["model_key", "model_label", "model_name"], as_index=False)
+        results_df.groupby(
+            ["model_key", "model_label", "model_name", "model_architecture"],
+            as_index=False,
+        )
         .agg(
             num_examples=("headline", "size"),
             non_empty_rate=("empty_output", lambda s: 1.0 - float(s.mean())),
@@ -316,7 +342,7 @@ def summarise_results(results_df: pd.DataFrame) -> pd.DataFrame:
             mean_perplexity=("perplexity", "mean"),
             median_perplexity=("perplexity", "median"),
         )
-        .sort_values("mean_cosine_similarity", ascending=False)
+        .sort_values(["mean_cosine_similarity", "mean_perplexity"], ascending=[False, True])
         .reset_index(drop=True)
     )
     return summary_df

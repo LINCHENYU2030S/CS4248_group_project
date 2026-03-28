@@ -18,9 +18,9 @@ from typing import Any
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_SOURCE_PATH = SCRIPT_DIR / "nonsarcastic_to_sarcastic_out.json"
-DEFAULT_FILTERED_PATH = SCRIPT_DIR / "nonsarcastic_to_sarcastic_similarityfiltered.json"
-DEFAULT_OUTPUT_PATH = SCRIPT_DIR / "nonsarcastic_to_sarcastic_test_set.json"
+DEFAULT_SOURCE_PATH = SCRIPT_DIR / "sarcastic_to_nonsarcastic_out.json"
+DEFAULT_FILTERED_PATH = SCRIPT_DIR / "sarcastic_to_nonsarcastic_filtered_similarity.json"
+DEFAULT_OUTPUT_PATH = SCRIPT_DIR / "sarcastic_to_nonsarcastic_test_set.json"
 
 
 def parse_args() -> argparse.Namespace:
