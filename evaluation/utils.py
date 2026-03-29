@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 DEFAULT_LABEL_COLUMN = "is_sarcastic"
 DEFAULT_HEADLINE_COLUMN = "headline"
+DEFAULT_CLASSIFIER_MODEL_NAME = "helinivan/english-sarcasm-detector"
 
 
 def get_source_style(label: int) -> str:
@@ -94,6 +95,12 @@ def clean_generation(text: str) -> str:
     return " ".join(cleaned.split())
 
 
+def preprocess_for_classifier(text: str) -> str:
+    import string
+
+    return str(text).lower().translate(str.maketrans("", "", string.punctuation)).strip()
+
+
 def load_dataset(
     dataset_path: Path,
     label_column: str = DEFAULT_LABEL_COLUMN,
@@ -125,6 +132,22 @@ def load_dataset(
     df["target_style"] = df[label_column].map(get_target_style)
     df["target_publication"] = df[label_column].map(get_target_publication)
     return df.reset_index(drop=True)
+
+
+def sample_dataset(
+    dataset_df: pd.DataFrame,
+    sample_fraction: float,
+    seed: int,
+) -> pd.DataFrame:
+    """Return a deterministic sample of the dataset for benchmarking."""
+    if not 0 < sample_fraction <= 1:
+        raise ValueError("`sample_fraction` must be in the interval (0, 1].")
+    if sample_fraction == 1:
+        return dataset_df.reset_index(drop=True)
+
+    sample_size = max(1, math.ceil(len(dataset_df) * sample_fraction))
+    sampled_df = dataset_df.sample(n=sample_size, random_state=seed)
+    return sampled_df.reset_index(drop=True)
 
 
 def load_generation_model(
@@ -230,6 +253,57 @@ def generate_rewrites(
     return outputs
 
 
+def load_sarcasm_classifier(
+    model_name: str,
+    device: str,
+) -> tuple["PreTrainedTokenizerBase", "PreTrainedModel"]:
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
+    model.to(device)
+    model.eval()
+    return tokenizer, model
+
+
+def predict_sarcasm_labels(
+    texts: list[str],
+    tokenizer: "PreTrainedTokenizerBase",
+    model: "PreTrainedModel",
+    device: str,
+    batch_size: int,
+    max_length: int,
+) -> tuple[list[int], list[float], list[float]]:
+    import torch
+    from tqdm.auto import tqdm
+
+    predictions: list[int] = []
+    confidences: list[float] = []
+    sarcastic_probabilities: list[float] = []
+
+    for start_idx in tqdm(range(0, len(texts), batch_size), desc="Classifier inference", leave=False):
+        batch_texts = [preprocess_for_classifier(text) for text in texts[start_idx : start_idx + batch_size]]
+        encoded = tokenizer(
+            batch_texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        encoded = {key: value.to(device) for key, value in encoded.items()}
+
+        with torch.inference_mode():
+            logits = model(**encoded).logits
+            probabilities = torch.softmax(logits, dim=-1)
+
+        batch_confidences, batch_predictions = probabilities.max(dim=-1)
+        predictions.extend(batch_predictions.detach().cpu().tolist())
+        confidences.extend(batch_confidences.detach().cpu().tolist())
+        sarcastic_probabilities.extend(probabilities[:, 1].detach().cpu().tolist())
+
+    return predictions, confidences, sarcastic_probabilities
+
+
 class ModelSpecLike(Protocol):
     key: str
     label: str
@@ -317,6 +391,11 @@ def evaluate_generations(
     output_dir: Path,
     run_name: str,
     perplexity_batch_size: int,
+    classifier_tokenizer: "PreTrainedTokenizerBase" | None = None,
+    classifier_model: "PreTrainedModel" | None = None,
+    classifier_device: str | None = None,
+    classifier_batch_size: int = 64,
+    classifier_max_length: int = 256,
     force_rescore: bool = False,
 ) -> pd.DataFrame:
     from evaluation.text_perplexity import batch_perplexity
@@ -337,6 +416,11 @@ def evaluate_generations(
 
     scored_df["cosine_similarity"] = math.nan
     scored_df["perplexity"] = math.nan
+    scored_df["classifier_predicted_label"] = math.nan
+    scored_df["classifier_confidence"] = math.nan
+    scored_df["classifier_sarcastic_probability"] = math.nan
+    scored_df["expected_rewrite_label"] = 1 - scored_df["is_sarcastic"].astype(int)
+    scored_df["classifier_correct"] = False
     scored_df["empty_output"] = ~valid_mask
     scored_df["rewrite_changed"] = (
         scored_df["headline"].str.strip().str.lower()
@@ -357,6 +441,44 @@ def evaluate_generations(
             ["cosine_similarity", "perplexity"]
         ].to_numpy()
 
+        if classifier_tokenizer is not None and classifier_model is not None:
+            if classifier_device is None:
+                raise ValueError("`classifier_device` must be provided when classifier scoring is enabled.")
+
+            predictions, confidences, sarcastic_probabilities = predict_sarcasm_labels(
+                texts=valid_df["generated_headline"].tolist(),
+                tokenizer=classifier_tokenizer,
+                model=classifier_model,
+                device=classifier_device,
+                batch_size=classifier_batch_size,
+                max_length=classifier_max_length,
+            )
+
+            valid_df["classifier_predicted_label"] = predictions
+            valid_df["classifier_confidence"] = confidences
+            valid_df["classifier_sarcastic_probability"] = sarcastic_probabilities
+            valid_df["classifier_correct"] = (
+                valid_df["classifier_predicted_label"].astype(int)
+                == valid_df["expected_rewrite_label"].astype(int)
+            )
+
+            scored_df.loc[
+                valid_mask,
+                [
+                    "classifier_predicted_label",
+                    "classifier_confidence",
+                    "classifier_sarcastic_probability",
+                    "classifier_correct",
+                ],
+            ] = valid_df[
+                [
+                    "classifier_predicted_label",
+                    "classifier_confidence",
+                    "classifier_sarcastic_probability",
+                    "classifier_correct",
+                ]
+            ].to_numpy()
+
     scored_df.to_csv(metrics_path, index=False)
     print(f"Saved metrics to {metrics_path}")
     return scored_df
@@ -372,6 +494,7 @@ def summarise_results(results_df: pd.DataFrame) -> pd.DataFrame:
             num_examples=("headline", "size"),
             non_empty_rate=("empty_output", lambda s: 1.0 - float(s.mean())),
             changed_rate=("rewrite_changed", "mean"),
+            classifier_accuracy=("classifier_correct", "mean"),
             mean_cosine_similarity=("cosine_similarity", "mean"),
             median_cosine_similarity=("cosine_similarity", "median"),
             mean_perplexity=("perplexity", "mean"),
