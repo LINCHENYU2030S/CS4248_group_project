@@ -40,24 +40,31 @@ def build_prompt(headline: str, label: int, architecture: str) -> str:
 
     if architecture == "seq2seq":
         if int(label) == 1:
-            return f"rewrite headline in huffpost non-sarcastic style: {headline}"
-        return f"rewrite headline in onion sarcastic style: {headline}"
+            return f"Rewrite this headline as a HuffPost-style non-sarcastic headline: {headline}"
+        return f"Rewrite this headline as an Onion-style sarcastic headline: {headline}"
 
     if int(label) == 1:
         return (
-            "Instruction: Rewrite the following news headline as a straightforward "
-            "HuffPost-style non-sarcastic headline. Preserve the same core "
-            "meaning, entities, and event details. Output only the rewritten "
-            "headline.\n"
-            f"Headline: {headline}\n"
+            "Task: Rewrite the news headline in HuffPost style.\n\n"
+            "Rules:\n"
+            "- Keep the same meaning.\n"
+            "- Output exactly one rewritten headline.\n"
+            "- Do not explain.\n"
+            "- Do not repeat the input.\n"
+            "- Do not output True or False.\n\n"
+            f"Input headline: {headline}\n"
             "Rewritten headline:"
         )
 
     return (
-        "Instruction: Rewrite the following news headline as an Onion-style "
-        "sarcastic headline. Preserve the same core meaning, entities, and "
-        "event details. Output only the rewritten headline.\n"
-        f"Headline: {headline}\n"
+        "Task: Rewrite the news headline in Onion style.\n\n"
+        "Rules:\n"
+        "- Keep the same meaning.\n"
+        "- Output exactly one rewritten headline.\n"
+        "- Do not explain.\n"
+        "- Do not repeat the input.\n"
+        "- Do not output True or False.\n\n"
+        f"Input headline: {headline}\n"
         "Rewritten headline:"
     )
 
