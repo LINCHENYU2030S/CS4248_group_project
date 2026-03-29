@@ -30,23 +30,34 @@ def get_target_publication(label: int) -> str:
     return "HuffPost" if int(label) == 1 else "The Onion"
 
 
-def build_prompt(headline: str, label: int) -> str:
-    """Build a rewrite prompt that strongly steers toward the target style."""
+def build_prompt(headline: str, label: int, architecture: str) -> str:
+    """Build a rewrite prompt tuned to the model architecture."""
     headline = str(headline).strip()
+    if architecture not in {"seq2seq", "causal"}:
+        raise ValueError(
+            f"Unsupported architecture {architecture!r}. Use 'seq2seq' or 'causal'."
+        )
+
+    if architecture == "seq2seq":
+        if int(label) == 1:
+            return f"rewrite headline in huffpost non-sarcastic style: {headline}"
+        return f"rewrite headline in onion sarcastic style: {headline}"
+
     if int(label) == 1:
         return (
-            "Rewrite the following headline as a straightforward HuffPost-style "
-            "non-sarcastic headline. Preserve the same core meaning, entities, "
-            "and event details. Output only the rewritten headline.\n"
-            f"Original headline: {headline}\n"
+            "Instruction: Rewrite the following news headline as a straightforward "
+            "HuffPost-style non-sarcastic headline. Preserve the same core "
+            "meaning, entities, and event details. Output only the rewritten "
+            "headline.\n"
+            f"Headline: {headline}\n"
             "Rewritten headline:"
         )
 
     return (
-        "Rewrite the following headline as an Onion-style sarcastic headline. "
-        "Preserve the same core meaning, entities, and event details. Output "
-        "only the rewritten headline.\n"
-        f"Original headline: {headline}\n"
+        "Instruction: Rewrite the following news headline as an Onion-style "
+        "sarcastic headline. Preserve the same core meaning, entities, and "
+        "event details. Output only the rewritten headline.\n"
+        f"Headline: {headline}\n"
         "Rewritten headline:"
     )
 
@@ -55,16 +66,25 @@ def clean_generation(text: str) -> str:
     """Normalize generated text into a single clean headline string."""
     cleaned = " ".join(str(text).strip().split())
     lowered = cleaned.lower()
-    for prefix in (
+
+    markers = (
         "rewritten headline:",
         "headline:",
         "output:",
         "answer:",
-    ):
-        if lowered.startswith(prefix):
-            cleaned = cleaned[len(prefix) :].strip()
-            lowered = cleaned.lower()
-    return cleaned
+    )
+    best_index = -1
+    best_marker = ""
+    for marker in markers:
+        marker_index = lowered.rfind(marker)
+        if marker_index > best_index:
+            best_index = marker_index
+            best_marker = marker
+
+    if best_index != -1:
+        cleaned = cleaned[best_index + len(best_marker) :].strip()
+
+    return " ".join(cleaned.split())
 
 
 def load_dataset(
@@ -97,10 +117,6 @@ def load_dataset(
     df["source_style"] = df[label_column].map(get_source_style)
     df["target_style"] = df[label_column].map(get_target_style)
     df["target_publication"] = df[label_column].map(get_target_publication)
-    df["prompt"] = df.apply(
-        lambda row: build_prompt(row[headline_column], row[label_column]),
-        axis=1,
-    )
     return df.reset_index(drop=True)
 
 
@@ -242,8 +258,20 @@ def run_generation_for_model(
     )
 
     try:
+        prompts = [
+            build_prompt(
+                headline=headline,
+                label=label,
+                architecture=model_spec.architecture,
+            )
+            for headline, label in zip(
+                dataset_df["headline"].tolist(),
+                dataset_df["is_sarcastic"].tolist(),
+            )
+        ]
+
         generated_headlines = generate_rewrites(
-            prompts=dataset_df["prompt"].tolist(),
+            prompts=prompts,
             tokenizer=tokenizer,
             model=model,
             device=device,
