@@ -5,4 +5,5 @@ __pycache__
 *.json
 *.ckpt
 dataset/
-fine_tuned_models/
+flan_t5/
+gpt-2/
