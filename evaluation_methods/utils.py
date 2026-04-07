@@ -70,12 +70,33 @@ def build_prompt(headline: str, label: int, architecture: str) -> str:
     )
 
 
+def build_finetuned_prompt(headline: str, label: int, architecture: str) -> str:
+    """Build the prompt format used when training the local LoRA adapters."""
+    headline = str(headline).strip()
+    if architecture not in {"seq2seq", "causal"}:
+        raise ValueError(
+            f"Unsupported architecture {architecture!r}. Use 'seq2seq' or 'causal'."
+        )
+
+    instruction = "Convert to sarcastic" if int(label) == 0 else "Convert to normal"
+    if architecture == "causal":
+        return (
+            f"### Instruction:\n{instruction}\n\n"
+            f"### Input:\n{headline}\n\n"
+            "### Response:\n"
+        )
+
+    return f"{instruction}\n\nInput: {headline}"
+
+
 def clean_generation(text: str) -> str:
     """Normalize generated text into a single clean headline string."""
     cleaned = " ".join(str(text).strip().split())
     lowered = cleaned.lower()
 
     markers = (
+        "### response:",
+        "response:",
         "rewritten headline:",
         "headline:",
         "output:",
@@ -398,8 +419,8 @@ def evaluate_generations(
     classifier_max_length: int = 256,
     force_rescore: bool = False,
 ) -> pd.DataFrame:
-    from evaluation.text_perplexity import batch_perplexity
-    from evaluation.text_similarity import batch_cosine_similarity
+    from evaluation_methods.text_perplexity import batch_perplexity
+    from evaluation_methods.text_similarity import batch_cosine_similarity
 
     model_key = generated_df["model_key"].iloc[0]
     metrics_path = output_dir / f"{run_name}_{model_key}_metrics.csv"
